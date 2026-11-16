@@ -1,0 +1,114 @@
+x-app: &app
+  image: ${COMPOSE_PROJECT_NAME:-payments}-app:local
+  build:
+    context: .
+    target: runtime
+  restart: unless-stopped
+  stop_grace_period: 180s
+  environment: &app-env
+    DATABASE_URL: postgresql+asyncpg://payments:${POSTGRES_PASSWORD:?set database password}@postgres:5432/payments
+    RABBITMQ_URL: amqp://payments:${RABBITMQ_PASSWORD:?set broker password}@rabbitmq:5672/
+    API_KEY: ${API_KEY:?set API key}
+    WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set signing secret}
+    WEBHOOK_ALLOWED_DOMAINS: ${WEBHOOK_ALLOWED_DOMAINS:?set domain allowlist}
+    ENVIRONMENT: ${ENVIRONMENT:-production}
+    ALLOW_UNSAFE_WEBHOOKS: ${ALLOW_UNSAFE_WEBHOOKS:-false}
+    RETRY_BASE_SECONDS: ${RETRY_BASE_SECONDS:-2}
+    HTTP_BODY_TIMEOUT_SECONDS: ${HTTP_BODY_TIMEOUT_SECONDS:-10}
+
+services:
+  postgres:
+    image: postgres:17.7-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_DB: payments
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set database password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    stop_grace_period: 180s
+
+  rabbitmq:
+    image: rabbitmq:4.2.1-management
+    hostname: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: payments
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set broker password}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: [CMD, gosu, rabbitmq, rabbitmq-diagnostics, -q, -t, '5', check_running]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    stop_grace_period: 180s
+
+  migrate:
+    <<: *app
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payments:${POSTGRES_PASSWORD:?set database password}@postgres:5432/payments
+    command: [alembic, upgrade, head]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: [python, -m, payments.api]
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, python, -c, 'import os,urllib.request; r=urllib.request.Request("http://127.0.0.1:8000/health/ready",headers={"X-API-Key":os.environ["API_KEY"]}); urllib.request.urlopen(r,timeout=3).close()']
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  consumer:
+    <<: *app
+    command: [python, -m, payments.worker]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, python, -m, payments.cli, worker-health]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  receiver:
+    <<: *app
+    profiles: [dev]
+    command: [python, examples/webhook_receiver.py]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set signing secret}
+      WEBHOOK_RECEIVER_HOST: 0.0.0.0
+      WEBHOOK_FAIL_FIRST: ${WEBHOOK_FAIL_FIRST:-0}
+    healthcheck:
+      test: [CMD, python, -c, 'import socket; socket.create_connection(("127.0.0.1",8081),timeout=2).close()']
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
