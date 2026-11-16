@@ -1,0 +1,16 @@
+# Allowlist: secrets, tests, docs and agent state never enter even a build layer.
+**
+!pyproject.toml
+!uv.lock
+!src/
+!src/**
+!migrations/
+!migrations/**
+!alembic.ini
+!examples/
+!examples/webhook_receiver.py
+**/__pycache__
+**/*.pyc
+**/.env*
+**/*.pem
+**/*.key
